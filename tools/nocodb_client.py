@@ -70,6 +70,18 @@ SPEC_COLUMNS = [
 # NOTE: "Есть регистрация на площадке" and "Аккредитация" are intentionally NOT mapped -
 # they are manual-only tracking checkboxes and are never written by extraction.
 FIELD_MAP = {
+    # "payment_days_summary" is a COMPUTED, NocoDB-only convenience field (not one
+    # of the 7 extraction blocks, not written to local XML/CSV by save_tender.py).
+    # The LLM fills it when building the JSON passed to this script - see
+    # CLAUDE.md, Шаг 7.1a "Краткий срок оплаты и цветовая метка" for the exact
+    # extraction/formatting rules (MSP-specific terms, worst-case day count,
+    # "N дней" / "N-M дней" format, appended " МСП" label, leading colour
+    # marker: "🟢 " when an advance payment (аванс) is provided (favourable
+    # for the supplier, regardless of day count - takes priority), else
+    # "🔴 " when postpayment-only and > 10 days, else no marker. The marker
+    # is what a manually-configured NocoDB "is like 🟢%" / "is like 🔴%"
+    # colouring rule keys off of; the API cannot set cell colour itself,
+    # only write the marker text).
     "source_file": "Файл-источник",
     "extracted_date": "Дата извлечения",
     "product_name": "Наименование предмета закупки",
@@ -108,6 +120,7 @@ FIELD_MAP = {
     "national_regime_measure": "Нацрежим - мера",
     "national_regime_items": "Нацрежим - товары",
     "national_regime_basis": "Нацрежим - основание",
+    "payment_days_summary": "Срок оплаты (кратко)",
 }
 
 PURCHASE_NUMBER_COLUMN = "Номер конкурса"
