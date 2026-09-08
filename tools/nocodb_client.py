@@ -21,6 +21,11 @@ Usage:
     extracted_fields.json uses the same flat field names as save_tender.py
     (see FIELD_MAP / CSV_COLUMNS in save_tender.py) - the LLM only needs to
     produce ONE json dict and pass it to both save_tender.py and this script.
+    This includes "internal_number" (Шаг 1a в CLAUDE.md) - save_tender.py is
+    normally run first and its result JSON carries the resolved internal_number
+    back, which should be merged into this JSON before calling this script, so
+    the same auto-assigned/reused value ends up in NocoDB too instead of this
+    script trying to assign its own.
 
 Optionally, pass --xlsx to also sync the "Позиции и цены" specification table
 (Шаг 5.1 в CLAUDE.md) into its OWN NocoDB table - one table per tender, named
@@ -35,10 +40,12 @@ Prints a JSON result to stdout:
 
 import argparse
 import json
+import re
 import sys
 import urllib.request
 import urllib.error
 import urllib.parse
+from datetime import date
 
 WORKSPACE_ID = "wzs963xn"
 BASE_ID = "pf3o1felxit8s5b"
@@ -49,25 +56,189 @@ RECORDS_URL = f"{BASE_URL}/{TABLE_ID}/records"
 SPEC_LINK_COLUMN = "Ссылка на спецификацию"
 
 # Column order for the per-tender specification table - must match the
-# "Позиции и цены" template in CLAUDE.md, Шаг 5.1. All text, same reasoning
-# as FIELD_MAP below (values can be "Не указано в документах" / "Не удалось
-# определить" placeholders instead of numbers).
+# "Позиции и цены" template in CLAUDE.md, Шаг 5.1.
+# (title, uidt, extra column props for the create-table API call or None).
+# Кол-во / НМЦК за позицию / Рыночная цена, руб. are typed Decimal/Currency
+# (RU locale, comma decimal) instead of plain text; Источник (ссылка) is
+# typed URL. Verified empirically against a scratch table on this base
+# (2026-09-04, then deleted) before wiring this in: Decimal/Currency reject
+# any non-numeric value and fail the WHOLE bulk insert (not just that
+# field/row) - see NUMERIC_SPEC_COLUMNS/sanitize_spec_row below for how
+# placeholders like "Не указано в документах" are handled so that stays
+# safe. URL, by contrast, does NOT validate its value at the API level at
+# all (an invalid or even "url1; url2" string is accepted as-is), so
+# "Источник (ссылка)" needs no special handling despite sometimes holding
+# two links joined by "; " (Шаг 5.1 в CLAUDE.md).
+#
+# "Рыночная цена (найдено в интернете)" stays plain LongText on purpose
+# (reverted 2026-09-04, tender RAD260041848 exposed this): it routinely
+# holds mixed-currency, approximate, free-text values straight from web
+# search - e.g. "≈3 500 € за шт. (ориентировочно; ...)" or "$12 940,80
+# (зарубежный дистрибьютор, ...)" - not just RUB numbers with commentary.
+# Coercing THAT text into a numeric column would silently grab the first
+# digit run regardless of currency (reading "3500" out of a €-quote and
+# storing it as if it were 3500 RUB - very wrong). The clean, always-RUB,
+# comment-free number the user wants for actual calculations goes in the
+# separate "Рыночная цена, руб." column instead (added 2026-09-04) - the
+# caller is responsible for converting non-RUB quotes to RUB before putting
+# a value there (see Шаг 5.1 в CLAUDE.md for where that conversion happens);
+# this module does not do currency conversion itself.
+# isLocaleString: best-effort attempt at a RU-style comma decimal display
+# for a plain Decimal column (Currency has a dedicated currency_locale meta
+# that forces ru-RU for any viewer; Decimal has no confirmed equivalent -
+# this key comes from a NocoDB PR referencing `meta.value.isLocaleString`
+# -> `.toLocaleString(undefined, ...)`, which follows the viewer's OWN
+# browser locale rather than forcing one. Not independently confirmed in
+# the NocoDB UI - a check via browser was interrupted by a tool glitch
+# 2026-09-04. If it doesn't show a comma for the user, drop this meta key
+# without worry, the stored value/precision (dtxs=2) is correct either way.
+# separator: the NocoDB UI's "Thousands and decimal separators" dropdown (screenshot from
+# the user, 2026-09-07: field "НМЦК за позицию" set to "None and comma (1000000,00)" - no
+# thousands separator, comma decimal point). Confirmed empirically by comparing that field's
+# meta via GET /meta/tables/{id} after the user set it through the NocoDB UI and clicked
+# "Update Field" - the previously-undocumented key is meta.separator, value "none_comma".
+# (The isLocaleString key above does NOT control this dropdown - see the comment on it; it's
+# a different, apparently cosmetic key kept only because it's harmless.) Applied to every
+# existing "НМЦК за позицию"/"Рыночная цена, руб." Decimal column across all spec tables via
+# a one-off PATCH /meta/columns/{id} on 2026-09-07 in addition to being baked in here for any
+# spec table created from now on. "Кол-во" (QTY_DECIMAL_META) is a quantity, not a price, and
+# was deliberately left on the default separator - only prices were in scope for this change.
+# precision: the NocoDB UI's Decimal "Precision" dropdown (how many decimal
+# digits are shown, e.g. "1.00") is driven by meta.precision, which is a
+# SEPARATE setting from dtxs (the actual Postgres column scale). Setting
+# dtxs alone stores the right value but the UI still showed "1.0" (1 digit)
+# until meta.precision was added too - confirmed empirically 2026-09-04
+# (user screenshot) by probing a scratch table and comparing to the live
+# "Рыночная цена, руб." column, then fixing it via a PATCH to
+# /meta/columns/{id}. Both must always be set together and kept in sync.
+RU_DECIMAL_META = {"dtxp": 15, "dtxs": 2, "meta": {"isLocaleString": True, "precision": 2, "separator": "none_comma"}}
+QTY_DECIMAL_META = {"dtxp": 15, "dtxs": 3, "meta": {"precision": 3}}
 SPEC_COLUMNS = [
-    ("№", "SingleLineText"),
-    ("Наименование позиции", "LongText"),
-    ("Марка/модель", "SingleLineText"),
-    ("Кол-во", "SingleLineText"),
-    ("Ед. изм.", "SingleLineText"),
-    ("НМЦК за позицию", "SingleLineText"),
-    ("Рыночная цена (найдено в интернете)", "SingleLineText"),
-    ("Источник (ссылка)", "SingleLineText"),
-    ("Примечание", "LongText"),
+    ("№", "SingleLineText", None),
+    ("Наименование позиции", "LongText", None),
+    ("Марка/модель", "SingleLineText", None),
+    ("Кол-во", "Decimal", QTY_DECIMAL_META),
+    ("Ед. изм.", "SingleLineText", None),
+    ("НМЦК за позицию", "Decimal", RU_DECIMAL_META),
+    ("Рыночная цена (найдено в интернете)", "LongText", None),
+    ("Рыночная цена, руб.", "Decimal", RU_DECIMAL_META),
+    ("Источник (ссылка)", "URL", None),
+    ("Примечание", "LongText", None),
 ]
+
+# Columns that must be a real number (or null) for NocoDB to accept them -
+# see the comment above SPEC_COLUMNS for why this matters.
+NUMERIC_SPEC_COLUMNS = ("Кол-во", "НМЦК за позицию", "Рыночная цена, руб.")
+
+# "НМЦК за позицию" is sometimes written as "77250.00 за ед. (154500.00 за
+# 2 шт.)" (per-unit price, with the actual line total in parentheses) -
+# confirmed on a real tender (32616325015, 2026-09-04). A plain first-number
+# parse would silently grab the per-unit figure instead of the total the
+# column name promises ("за позицию" = for the whole line). This pattern
+# pulls out the parenthetical total when present.
+POSITION_TOTAL_RE = re.compile(r"\(([\d\s.,]+)\s*за\s*\d+\s*(?:шт|ед)\.?\)", re.IGNORECASE)
+
+
+def parse_position_total(raw):
+    """Parse "НМЦК за позицию" specifically - prefers the "(Y за N шт.)"
+    total over a leading per-unit figure when both are present in the text,
+    otherwise behaves like parse_ru_number()."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    text = str(raw)
+    match = POSITION_TOTAL_RE.search(text)
+    if match:
+        return parse_ru_number(match.group(1))
+    return parse_ru_number(text)
+
+
+def parse_ru_number(raw):
+    """Best-effort parse of one spec-table numeric cell into a float.
+
+    Accepts an already-numeric openpyxl cell (int/float) as well as RU
+    -formatted number text ("1 500 000,55", "1500000.55", "12 шт." - a
+    trailing non-numeric unit is ignored - same digit-token approach as
+    normalize_number() in save_tender.py). Returns None when no numeric
+    token can be found at all (e.g. "Не указано в документах", "Не удалось
+    определить") - the caller must make sure that original text isn't just
+    silently lost, see sanitize_spec_row().
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    raw = str(raw).strip()
+    if not raw:
+        return None
+
+    match = re.search(r"\d(?:[\d\s.,]*\d)?", raw)
+    if not match:
+        return None
+    cleaned = re.sub(r"\s", "", match.group(0))
+
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        parts = cleaned.split(",")
+        if len(parts[-1]) == 2:
+            cleaned = cleaned.replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif cleaned.count(".") > 1:
+        cleaned = cleaned.replace(".", "")
+    elif cleaned.count(".") == 1:
+        integer_part, _, frac_part = cleaned.partition(".")
+        if len(frac_part) == 3 and len(integer_part) <= 3:
+            cleaned = cleaned.replace(".", "")
+
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def sanitize_spec_row(row: dict) -> dict:
+    """Turn one Позиции_и_цены.xlsx row into a record NocoDB will accept.
+
+    NUMERIC_SPEC_COLUMNS have to be real numbers or null - a placeholder
+    string in any one of them would make NocoDB reject the entire bulk
+    insert (confirmed empirically, see the SPEC_COLUMNS comment). When a
+    value can't be parsed as a number, the field is sent as null and the
+    original text is preserved by appending it to "Примечание" instead of
+    being silently dropped.
+    """
+    out = dict(row)
+    extra_notes = []
+    for col in NUMERIC_SPEC_COLUMNS:
+        if col not in out:
+            continue
+        raw = out[col]
+        parser = parse_position_total if col == "НМЦК за позицию" else parse_ru_number
+        value = parser(raw)
+        if value is None:
+            if raw is not None and str(raw).strip():
+                extra_notes.append(f"{col}: {raw}")
+            out[col] = None
+        else:
+            out[col] = value
+    if extra_notes:
+        existing = str(out.get("Примечание") or "").strip()
+        addition = "; ".join(extra_notes)
+        out["Примечание"] = f"{existing}; {addition}" if existing else addition
+    return out
 
 # Flat field name (matches save_tender.py / all_tenders.csv columns) -> NocoDB column title.
 # "purchase_number" and "tender_url" map onto the two columns that already existed
 # in the table before this integration; everything else was added for this integration.
-# NOTE: "Есть регистрация на площадке" and "Аккредитация" are intentionally NOT mapped -
+# "internal_number" (added Шаг 1a в CLAUDE.md) maps onto "Внутренний номер" - unlike the
+# other columns, that one is auto-created by ensure_column() below if it's missing,
+# instead of requiring the user to add it by hand in the NocoDB UI first.
+# NOTE: "Есть регистрация на площадке" и "Аккредитация" are intentionally NOT mapped -
 # they are manual-only tracking checkboxes and are never written by extraction.
 FIELD_MAP = {
     # "payment_days_summary" is a COMPUTED, NocoDB-only convenience field (not one
@@ -82,6 +253,7 @@ FIELD_MAP = {
     # is what a manually-configured NocoDB "is like 🟢%" / "is like 🔴%"
     # colouring rule keys off of; the API cannot set cell colour itself,
     # only write the marker text).
+    "internal_number": "Внутренний номер",
     "source_file": "Файл-источник",
     "extracted_date": "Дата извлечения",
     "product_name": "Наименование предмета закупки",
@@ -123,9 +295,126 @@ FIELD_MAP = {
     "payment_days_summary": "Срок оплаты (кратко)",
 }
 
+# Columns this script will auto-create on the main "Реестр конкурсов" table if
+# they're missing, instead of requiring the user to add them by hand first.
+# title -> (uidt, extra column props or None). Keep this list small/deliberate -
+# most FIELD_MAP columns were added by hand in the NocoDB UI when the
+# integration was first built; this is only for columns introduced later that
+# should just work out of the box.
+#
+# "Номер конкурса" (PURCHASE_NUMBER_COLUMN below) is included here because a
+# live check against the production table (2026-09-07, testing the new
+# internal_number feature) found it missing entirely - find_record() against
+# it failed with a hard HTTP 422 ("Column alias 'Номер конкурса' not found"),
+# which meant upsert() couldn't look up ANY tender by purchase number and the
+# whole NocoDB sync step was broken, not just for internal_number. Confirmed
+# with the user (2026-09-07) that recreating this column is the fix, rather
+# than matching on some other existing column. Note: "Внутренний номер" is
+# also already present in the live table as its primary/title column (pv:
+# True) and already held one hand-entered value ("К897", Cyrillic К, no
+# dash) plus, on other rows, old purchase/folder numbers used as makeshift
+# identifiers before this column existed for that purpose - confirmed with
+# the user that new auto-assigned values should still use the "K-983" format
+# (Latin K + dash) from Шаг 1a в CLAUDE.md rather than matching that legacy style.
+AUTO_CREATE_COLUMNS = {
+    "Внутренний номер": ("SingleLineText", None),
+    "Номер конкурса": ("SingleLineText", None),
+}
+
+# Column title -> title of the column it should sit immediately after in the
+# default grid view, applied only right after ensure_columns() actually
+# CREATES that column (a column the user later reorders by hand is never
+# touched again). Without this, the "create column" API just appends new
+# columns at the very end of the table, which is where "Номер конкурса"
+# landed when it was auto-created (see AUTO_CREATE_COLUMNS above) - the user
+# asked (2026-09-07) for it to sit between "Внутренний номер" and "Ссылка на
+# процедуру" instead (its natural spot, next to the other tender-identifying
+# columns), so this makes that positioning automatic/self-healing if the
+# column is ever deleted and auto-recreated again, instead of requiring the
+# same manual reorder through the API a second time.
+AUTO_CREATE_COLUMN_POSITION_AFTER = {
+    "Номер конкурса": "Внутренний номер",
+}
+
 PURCHASE_NUMBER_COLUMN = "Номер конкурса"
 SOURCE_FILE_COLUMN = "Файл-источник"
 NOT_SPECIFIED = "Не указано в документах"
+
+# Fields where a missing value should read as a plain dash "—" rather than
+# NOT_SPECIFIED - see the matching DASH_FIELDS in save_tender.py for the
+# full rationale (user request, 2026-09-07: no link to the procurement
+# documentation -> "—", not "Не указано в документах"). Claude already
+# writes "—" directly when assembling the flat JSON (same file feeds both
+# save_tender.py and this script), so this is a safety net here too, in
+# case that JSON still has the old placeholder or an empty value.
+DASH = "—"
+DASH_FIELDS = ("tender_url",)
+
+
+def apply_dash_placeholders(flat_data):
+    """Normalizes DASH_FIELDS in-place: missing/empty/NOT_SPECIFIED -> "—"."""
+    for flat_name in DASH_FIELDS:
+        value = str(flat_data.get(flat_name) or "").strip()
+        if not value or value == NOT_SPECIFIED:
+            flat_data[flat_name] = DASH
+    return flat_data
+
+
+# "Начальная цена" (main table, FIELD_MAP["start_price"]) is plain SingleLineText,
+# not Decimal - it has to stay text because it also holds the NOT_SPECIFIED
+# placeholder and occasional multi-number text ("3805861.62 руб. включая НДС
+# (3119558.70 руб. без НДС)", tender 905-U310-26/3333, K-985) that a real
+# Decimal column would reject outright. save_tender.py's normalize_number()
+# already guarantees any actual price number inside that text is a clean
+# "<digits>.<exactly two digits>" token (no thousands separator) before this
+# script ever sees it - the only thing left to fix for the NocoDB copy of the
+# value is the decimal point itself: the user asked (2026-09-07, same request
+# that produced the Decimal "separator": "none_comma" meta above) for every
+# price actually showing up in NocoDB to use a comma there instead, with no
+# other dots/commas in the number. This only touches the copy of the string
+# sent to NocoDB - save_tender.py's own XML/CSV output (and the on-disk JSON)
+# are untouched, since nothing here mutates the source JSON file itself.
+PRICE_NUMBER_RE = re.compile(r"(?<!\d)(\d+)\.(\d{2})(?!\d)")
+
+
+def to_comma_decimal(text):
+    """Replace every clean "<digits>.<exactly 2 digits>" token in `text` with
+    "<digits>,<2 digits>" - i.e. swap the decimal point for a comma without
+    touching anything else (placeholder text, ✅/🔺 markers, "руб. включая
+    НДС" wording, a second number in parentheses, etc. all pass through
+    unchanged). Safe to call on any string, including NOT_SPECIFIED/empty."""
+    if not text:
+        return text
+    return PRICE_NUMBER_RE.sub(lambda m: f"{m.group(1)},{m.group(2)}", text)
+
+
+# "Адрес заказчика" - user request (2026-09-08): the address itself should
+# render in bold in NocoDB, but the postal index (6-digit ЯЯЯЯЯЯ, wherever it
+# sits in the string - leading "123456, г. Москва..." and trailing "...,
+# 123456" both occur in real tenders) must stay un-bolded. The column was
+# plain LongText with no rich-text formatting until now - PATCHed via the
+# Meta API (2026-09-08) to add meta.richMode=True/smartMode=False, matching
+# "Наименование предмета закупки" (see product_name_formatting.md in project
+# memory), so Markdown **bold** actually renders instead of showing as
+# literal asterisks.
+POSTAL_INDEX_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+
+
+def bold_address_except_index(address):
+    """Wraps `address` in Markdown bold, carving out the first standalone
+    6-digit postal index (if any) so it stays plain text. Safe to call on
+    any string, including NOT_SPECIFIED/DASH/empty (returned unchanged)."""
+    if not address or address in (NOT_SPECIFIED, DASH):
+        return address
+    match = POSTAL_INDEX_RE.search(address)
+    if not match:
+        return f"**{address}**"
+    before, index, after = address[:match.start()], match.group(1), address[match.end():]
+    parts = []
+    parts.append(f"**{before}**" if before.strip(" ,") else before)
+    parts.append(index)
+    parts.append(f"**{after}**" if after.strip(" ,") else after)
+    return "".join(parts)
 
 
 def _request(method, url, token, body=None):
@@ -152,15 +441,112 @@ def find_record(token, column, value):
     return rows[0] if rows else None
 
 
-def upsert(token, flat_data: dict, spec_xlsx_path: str = None, fallback_id: str = None):
+def get_table_columns(token, table_id):
+    """Returns {column_title: column_meta_dict} for an existing table."""
+    status, body = _request("GET", f"{META_URL}/tables/{table_id}", token)
+    if status != 200:
+        raise RuntimeError(f"get table failed: HTTP {status} {body}")
+    return {c["title"]: c for c in body.get("columns", [])}
+
+
+def position_column_after(token, table_id, column_id, anchor_title):
+    """Moves column_id to sit immediately after the column titled
+    anchor_title in the table's default grid view (see
+    AUTO_CREATE_COLUMN_POSITION_AFTER). Best-effort: any failure here is
+    swallowed (the column still exists and works, just wherever the create
+    -column API put it) rather than failing the whole sync over cosmetics.
+
+    Mechanics: a grid view's left-to-right column order is controlled by
+    each column's OWN per-view record (GET/PATCH
+    /meta/views/{viewId}/columns/{viewColumnId} - viewColumnId, not the
+    column's own id, confirmed empirically 2026-09-07: PATCHing by the
+    column id itself 404s with ERR_FIELD_NOT_FOUND), not by the base
+    column's table-level `order` field. Orders are plain floats and don't
+    need to be contiguous, so the new column is just given the midpoint
+    between the anchor's order and whatever comes right after it (or
+    anchor_order + 1 if the anchor is currently last).
+    """
+    try:
+        view_id = get_default_view_id(token, table_id)
+        if not view_id:
+            return
+        status, body = _request("GET", f"{META_URL}/views/{view_id}/columns", token)
+        if status != 200:
+            return
+        view_columns = body.get("list", [])
+
+        id_to_title = get_table_columns(token, table_id)  # title -> column meta
+        title_to_id = {meta["id"]: title for title, meta in id_to_title.items()}
+
+        by_column_id = {vc["fk_column_id"]: vc for vc in view_columns}
+        target_vc = by_column_id.get(column_id)
+        anchor_id = id_to_title.get(anchor_title, {}).get("id")
+        anchor_vc = by_column_id.get(anchor_id) if anchor_id else None
+        if not target_vc or not anchor_vc:
+            return
+
+        anchor_order = anchor_vc["order"]
+        later_orders = [vc["order"] for vc in view_columns if vc["order"] > anchor_order]
+        new_order = (anchor_order + min(later_orders)) / 2 if later_orders else anchor_order + 1
+
+        _request("PATCH", f"{META_URL}/views/{view_id}/columns/{target_vc['id']}", token, {"order": new_order})
+    except Exception:
+        pass
+
+
+def ensure_columns(token, table_id, titles):
+    """Auto-creates any of AUTO_CREATE_COLUMNS listed in `titles` that don't
+    already exist on the table - e.g. "Внутренний номер" the first time this
+    script runs after Шаг 1a was added, so the user doesn't have to go add it
+    by hand in the NocoDB UI first. Safe to call every run (no-op once the
+    column exists). Newly-created columns listed in
+    AUTO_CREATE_COLUMN_POSITION_AFTER are also moved into place (see
+    position_column_after) instead of being left at the end of the table."""
+    wanted = [t for t in titles if t in AUTO_CREATE_COLUMNS]
+    if not wanted:
+        return
+    existing = get_table_columns(token, table_id)
+    for title in wanted:
+        if title in existing:
+            continue
+        uidt, extra = AUTO_CREATE_COLUMNS[title]
+        col = {"title": title, "uidt": uidt}
+        if extra:
+            col.update(extra)
+        status, body = _request("POST", f"{META_URL}/tables/{table_id}/columns", token, col)
+        if status != 200:
+            raise RuntimeError(f"create column '{title}' failed: HTTP {status} {body}")
+        anchor_title = AUTO_CREATE_COLUMN_POSITION_AFTER.get(title)
+        if anchor_title:
+            # The create-column response is the TABLE's meta, not the new
+            # column's (confirmed empirically 2026-09-07 on a scratch column -
+            # its "id" is fk_model_id, i.e. the table id) - re-fetch columns to
+            # find the new column's own id by title.
+            new_column_id = get_table_columns(token, table_id).get(title, {}).get("id")
+            if new_column_id:
+                position_column_after(token, table_id, new_column_id, anchor_title)
+
+
+def upsert(token, flat_data: dict, spec_xlsx_path: str = None, fallback_id: str = None, fx_rates: dict = None):
     """fallback_id: used to name/find the spec table when the tender has no real
     purchase_number (placeholder "Не указано в документах") - e.g. the tender's
     local folder name/id, so the spec table can still be created and found later
     even without an official notice number. Not required if the tender does have
-    a real purchase_number."""
+    a real purchase_number.
+
+    fx_rates: passed straight through to enrich_market_price_rub() - see
+    convert_market_price_to_rub() for the expected shape ({"€": ..., "$": ...})."""
     purchase_number = flat_data.get("purchase_number")
     if not purchase_number:
         raise ValueError("flat_data must include 'purchase_number' for upsert matching")
+
+    apply_dash_placeholders(flat_data)
+    if flat_data.get("start_price"):
+        flat_data["start_price"] = to_comma_decimal(str(flat_data["start_price"]))
+    if flat_data.get("address"):
+        flat_data["address"] = bold_address_except_index(str(flat_data["address"]))
+
+    ensure_columns(token, TABLE_ID, [FIELD_MAP.get(k) for k in flat_data.keys()])
 
     row = {}
     for flat_name, value in flat_data.items():
@@ -178,6 +564,7 @@ def upsert(token, flat_data: dict, spec_xlsx_path: str = None, fallback_id: str 
         spec_id = purchase_number if purchase_number != NOT_SPECIFIED else fallback_id
         if spec_id:
             spec_rows = read_spec_xlsx(spec_xlsx_path)
+            spec_rows = enrich_market_price_rub(spec_rows, fx_rates)
             spec_table_url = sync_specification(token, spec_id, spec_rows)
             row[SPEC_LINK_COLUMN] = spec_table_url
 
@@ -224,7 +611,12 @@ def find_table_by_title(token, title):
 
 
 def create_spec_table(token, title):
-    columns = [{"title": name, "uidt": uidt} for name, uidt in SPEC_COLUMNS]
+    columns = []
+    for name, uidt, extra in SPEC_COLUMNS:
+        col = {"title": name, "uidt": uidt}
+        if extra:
+            col.update(extra)
+        columns.append(col)
     status, body = _request("POST", f"{META_URL}/bases/{BASE_ID}/tables", token,
                              {"title": title, "columns": columns})
     if status != 200:
@@ -268,7 +660,8 @@ def sync_specification(token, purchase_number: str, spec_rows: list):
 
     table_id = table["id"]
     if spec_rows:
-        status, body = _request("POST", f"{BASE_URL}/{table_id}/records", token, spec_rows)
+        safe_rows = [sanitize_spec_row(r) for r in spec_rows]
+        status, body = _request("POST", f"{BASE_URL}/{table_id}/records", token, safe_rows)
         if status != 200:
             raise RuntimeError(f"insert spec rows failed: HTTP {status} {body}")
 
@@ -280,6 +673,18 @@ def sync_specification(token, purchase_number: str, spec_rows: list):
 
 
 def read_spec_xlsx(xlsx_path: str):
+    """Read Позиции_и_цены.xlsx into one dict per actual item row.
+
+    Skips the trailing "Итого НМЦК:" totals row and any other non-item row
+    (a blank separator row, or a sheet-level note row that only fills the
+    "№"/"Примечание" cells with free text) - a real position always has
+    "Наименование позиции" filled, so that's what's used to tell a real row
+    from a summary/note row (confirmed against real tenders' xlsx files
+    2026-09-04: RAD260041848's "Итого НМЦК:" row, 9594163's blank row and
+    its trailing "Примечание: ..." note row all lack it). NocoDB's per
+    -tender spec table is meant to be an item list, not a place for the
+    tender-level total or free-standing notes.
+    """
     import openpyxl
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     ws = wb.worksheets[0]
@@ -288,9 +693,93 @@ def read_spec_xlsx(xlsx_path: str):
     records = []
     for r in rows[1:]:
         rec = {h: v for h, v in zip(headers, r) if v is not None and h is not None}
-        if rec:
+        if rec and str(rec.get("Наименование позиции") or "").strip():
             records.append(rec)
     return records
+
+
+# Currency symbol -> what it's called in the conversion note. Extend this
+# (and pass the matching --<code>-rate on the CLI, lower-cased) if a tender
+# ever quotes a market price in some other currency.
+MARKET_PRICE_CURRENCIES = {"€": "EUR", "$": "USD"}
+
+
+def convert_market_price_to_rub(raw_text, rates: dict = None):
+    """Derive the clean "Рыночная цена, руб." value + a conversion note (or
+    None, None) from the free-text "Рыночная цена (найдено в интернете)"
+    cell.
+
+    "Рыночная цена (найдено в интернете)" is deliberately left as plain text
+    (see the SPEC_COLUMNS comment) because it routinely mixes currencies and
+    commentary - e.g. "≈3 500 € за шт. (ориентировочно; ...)" or "$12 940,80
+    (зарубежный дистрибьютор, ...)", not just RUB numbers with a comment.
+    This function is what actually does the currency-aware parsing so that
+    work doesn't have to be redone by hand for every tender (added
+    2026-09-04, after doing it as a one-off for tender RAD260041848).
+
+    rates: {"€": <RUB per EUR>, "$": <RUB per USD>, ...} - today's CBR rate
+    for whichever foreign currencies actually show up in this tender's data
+    (look them up with a web search, e.g. "курс доллара евро ЦБ РФ сегодня",
+    and pass them via --usd-rate/--eur-rate). A currency symbol found in the
+    text with no matching rate in `rates` is left unconverted (returns None
+    for the value, with a note explaining why) rather than guessed at -
+    silently treating "$12 940,80" as 12940.80 RUB would be badly wrong.
+
+    Returns (rub_value_or_None, note_or_None).
+    """
+    if raw_text is None:
+        return None, None
+    text = str(raw_text).strip()
+    if not text:
+        return None, None
+    lowered = text.lower()
+    if lowered.startswith("не удалось определить") or lowered.startswith("не указано"):
+        return None, None
+
+    rates = rates or {}
+    currency_symbol = None
+    for sym in MARKET_PRICE_CURRENCIES:
+        if sym in text:
+            currency_symbol = sym
+            break
+
+    value = parse_ru_number(text)
+    if value is None:
+        return None, None
+
+    if currency_symbol is None:
+        # No foreign-currency symbol found - already RUB (₽/руб. or a bare number).
+        return round(value, 2), None
+
+    rate = rates.get(currency_symbol)
+    if rate is None:
+        return None, (
+            f"Рыночная цена, руб.: не переведено — курс {currency_symbol}/руб не передан "
+            f"(--{MARKET_PRICE_CURRENCIES[currency_symbol].lower()}-rate) для \"{text}\""
+        )
+
+    rub = round(value * rate, 2)
+    note = (
+        f"Рыночная цена, руб.: переведено из {value:.2f} {currency_symbol} по курсу ЦБ РФ "
+        f"на {date.today().strftime('%d.%m.%Y')} (1 {currency_symbol} = {rate} руб.)"
+    )
+    return rub, note
+
+
+def enrich_market_price_rub(records: list, rates: dict = None) -> list:
+    """Fill in "Рыночная цена, руб." (and a conversion note in "Примечание")
+    on each spec row, derived from its "Рыночная цена (найдено в интернете)"
+    text - see convert_market_price_to_rub(). Does not mutate the input."""
+    out = []
+    for rec in records:
+        rec = dict(rec)
+        rub_value, note = convert_market_price_to_rub(rec.get("Рыночная цена (найдено в интернете)"), rates)
+        rec["Рыночная цена, руб."] = rub_value
+        if note:
+            existing = str(rec.get("Примечание") or "").strip()
+            rec["Примечание"] = f"{existing}; {note}" if existing else note
+        out.append(rec)
+    return out
 
 
 def main():
@@ -299,6 +788,8 @@ def main():
     parser.add_argument("--token-file", required=True, help="Path to the file containing the NocoDB API token")
     parser.add_argument("--xlsx", required=False, help="Path to Позиции_и_цены.xlsx - if given, also syncs it into its own NocoDB table and links it from the main record")
     parser.add_argument("--fallback-id", required=False, help="Identifier to name the spec table by when the tender has no real purchase_number (e.g. the tender's local folder name)")
+    parser.add_argument("--usd-rate", required=False, type=float, help="Today's CBR RUB-per-USD rate (look it up first) - needed only if some position's Рыночная цена is quoted in $")
+    parser.add_argument("--eur-rate", required=False, type=float, help="Today's CBR RUB-per-EUR rate (look it up first) - needed only if some position's Рыночная цена is quoted in €")
     args = parser.parse_args()
 
     with open(args.json, "r", encoding="utf-8") as f:
@@ -306,7 +797,13 @@ def main():
     with open(args.token_file, "r", encoding="utf-8") as f:
         token = f.read().strip()
 
-    result = upsert(token, flat_data, spec_xlsx_path=args.xlsx, fallback_id=args.fallback_id)
+    fx_rates = {}
+    if args.usd_rate:
+        fx_rates["$"] = args.usd_rate
+    if args.eur_rate:
+        fx_rates["€"] = args.eur_rate
+
+    result = upsert(token, flat_data, spec_xlsx_path=args.xlsx, fallback_id=args.fallback_id, fx_rates=fx_rates or None)
     print(json.dumps(result, ensure_ascii=False))
 
 

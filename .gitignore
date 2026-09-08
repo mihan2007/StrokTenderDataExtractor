@@ -1,0 +1,14 @@
+# Секреты (API-ключи) — не должны попадать в git-репозиторий (см. secrets_policy в project memory)
+/secrets/
+
+# Python
+__pycache__/
+*.pyc
+
+# Временные файлы инструментов
+/tools/_to_delete/
+
+# Тестовые/временные файлы в корне проекта
+/_test_entry/
+/_test_entry2/
+/_to_delete/
