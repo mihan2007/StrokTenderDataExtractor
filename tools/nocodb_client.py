@@ -35,7 +35,23 @@ always be found later from the main tender row.
 
 Prints a JSON result to stdout:
     {"action": "created"|"updated", "record_id": <int>, "purchase_number": "...",
-     "spec_table_url": "..." (only if --xlsx was given)}
+     "verification": {"ok": bool, "checked_fields": int, "issues": [...]},
+     "spec_table_url": "..." (only if --xlsx was given),
+     "spec_verification": {"ok": bool, "expected_rows": int, "actual_rows": int,
+                            "issues": [...]} (only if --xlsx was given)}
+
+verification / spec_verification (added 2026-09-09): right after writing, this
+script re-reads the record (and, with --xlsx, every row of the spec table)
+back from NocoDB and compares it against what THIS run intended to send -
+this is what catches the class of bug already seen twice on this project
+("Файл-источник" and "Номер конкурса" both went empty in NocoDB while the
+script itself printed a success result) automatically, instead of relying on
+someone noticing by chance later. "ok": false means at least one field/row
+came back different from what was sent (most often empty) - "issues" lists
+exactly which ones. This never raises or changes the exit code by itself
+(the create/update already succeeded by the time verification runs) -
+callers must check "ok"/"issues" and tell the user, rather than assume
+success just because the process exited cleanly.
 """
 
 import argparse
@@ -606,6 +622,8 @@ def upsert(token, flat_data: dict, spec_xlsx_path: str = None, fallback_id: str 
         row[col] = value
 
     spec_table_url = None
+    spec_table_id = None
+    spec_safe_rows = None
     if spec_xlsx_path:
         # Prefer the real purchase number to name the spec table; fall back to
         # fallback_id (e.g. the tender's local folder name) when there isn't one -
@@ -615,7 +633,7 @@ def upsert(token, flat_data: dict, spec_xlsx_path: str = None, fallback_id: str 
         if spec_id:
             spec_rows = read_spec_xlsx(spec_xlsx_path)
             spec_rows = enrich_market_price_rub(spec_rows, fx_rates)
-            spec_table_url = sync_specification(token, spec_id, spec_rows)
+            spec_table_url, spec_table_id, spec_safe_rows = sync_specification(token, spec_id, spec_rows)
             row[SPEC_LINK_COLUMN] = spec_table_url
 
     # When the purchase number itself wasn't found in the documents, matching on it
@@ -639,8 +657,19 @@ def upsert(token, flat_data: dict, spec_xlsx_path: str = None, fallback_id: str 
             raise RuntimeError(f"create failed: HTTP {status} {body}")
         result = {"action": "created", "record_id": body.get("Id"), "purchase_number": purchase_number}
 
+    # Post-write verification (added 2026-09-09, user request - this project's
+    # own memory already logged two silent-failure incidents where the script
+    # printed success but a column ("Файл-источник", then "Номер конкурса")
+    # actually stayed empty in NocoDB): re-read what was actually written and
+    # compare it against what this run intended to send, instead of trusting
+    # the create/update HTTP 200 alone. Best-effort - a failure of the
+    # verification GET itself is reported as its own issue rather than raised,
+    # since the record write already succeeded by this point.
+    result["verification"] = verify_main_record(token, result["record_id"], row)
+
     if spec_table_url:
         result["spec_table_url"] = spec_table_url
+        result["spec_verification"] = verify_spec_table(token, spec_table_id, spec_safe_rows or [])
     return result
 
 
@@ -694,12 +723,18 @@ def clear_table_records(token, table_id):
 
 
 def sync_specification(token, purchase_number: str, spec_rows: list):
-    """Ensure a per-tender spec table exists, (re)fill it with spec_rows, return its URL.
+    """Ensure a per-tender spec table exists, (re)fill it with spec_rows.
 
     spec_rows: list of dicts keyed by the SPEC_COLUMNS titles (e.g. one dict per
     row of Позиции_и_цены.xlsx, as read by openpyxl with the header row as keys).
     Re-running this for the same purchase_number replaces the table's contents
     rather than duplicating rows - safe to re-run after a correction.
+
+    Returns (url, table_id, safe_rows) - table_id and the sanitized rows that
+    were actually sent (see sanitize_spec_row) are returned alongside the url
+    so the caller (upsert(), see verify_spec_table() above) can re-read the
+    table afterwards and verify it landed correctly, without re-deriving what
+    was sent from scratch.
     """
     title = _spec_table_title(purchase_number)
     table = find_table_by_title(token, title)
@@ -709,8 +744,8 @@ def sync_specification(token, purchase_number: str, spec_rows: list):
         clear_table_records(token, table["id"])
 
     table_id = table["id"]
-    if spec_rows:
-        safe_rows = [sanitize_spec_row(r) for r in spec_rows]
+    safe_rows = [sanitize_spec_row(r) for r in spec_rows] if spec_rows else []
+    if safe_rows:
         # NocoDB's bulk-insert endpoint caps a single request at 100 records
         # (HTTP 422 ERR_MAX_PAYLOAD_LIMIT_EXCEEDED) - found 2026-09-09 on a
         # real 116-position tender. Split into batches to stay under that cap.
@@ -725,7 +760,7 @@ def sync_specification(token, purchase_number: str, spec_rows: list):
     url = f"https://app.nocodb.com/{WORKSPACE_ID}/{BASE_ID}/{table_id}"
     if view_id:
         url += f"/{view_id}"
-    return url
+    return url, table_id, safe_rows
 
 
 def read_spec_xlsx(xlsx_path: str):
@@ -838,6 +873,142 @@ def enrich_market_price_rub(records: list, rates: dict = None) -> list:
     return out
 
 
+def _normalize_compare(value):
+    """Normalize a value (from either the row we sent or NocoDB's response) for
+    equality comparison in verify_main_record/verify_spec_table below -
+    stringifies, normalizes newlines, strips surrounding whitespace. None and
+    empty string both collapse to "" so "field wasn't sent" and "field is
+    literally blank" compare the same way."""
+    if value is None:
+        return ""
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    return text.strip()
+
+
+def _values_match(expected, actual, numeric=False):
+    """True if `expected` (what this run intended to send) and `actual` (what
+    NocoDB now holds) should be considered the same value. numeric=True
+    compares as floats with a small tolerance (Decimal columns round-trip
+    through JSON as numbers, not strings) instead of exact text."""
+    if numeric:
+        try:
+            e = float(expected) if expected not in (None, "") else None
+        except (TypeError, ValueError):
+            e = None
+        try:
+            a = float(actual) if actual not in (None, "") else None
+        except (TypeError, ValueError):
+            a = None
+        if e is None and a is None:
+            return True
+        if e is None or a is None:
+            return False
+        return abs(e - a) < 0.005
+    return _normalize_compare(expected) == _normalize_compare(actual)
+
+
+def verify_main_record(token, record_id, expected_row):
+    """Re-fetches the just-written record from "Реестр конкурсов" (Шаг 7.1 в
+    CLAUDE.md) and compares every column this run actually sent (`expected_row`
+    - the same dict passed to the create/update request) against what NocoDB
+    now holds. Added 2026-09-09 after this project's memory already recorded
+    two incidents where a column silently stayed empty in NocoDB even though
+    the script itself reported success ("Файл-источник" on 2026-09-07,
+    "Номер конкурса" missing as a column entirely, also found 2026-09-07) -
+    this makes that class of bug visible automatically on every run instead of
+    waiting for someone to notice by chance.
+
+    Best-effort: if the verification GET itself fails (network hiccup, etc.)
+    that's reported as a single issue rather than raised - the record write
+    already succeeded by the time this runs, so a failed *check* shouldn't be
+    reported as a failed *write*.
+
+    Returns {"ok": bool, "checked_fields": int, "issues": [...]}. Each issue
+    is {"column": ..., "expected": ..., "actual": ..., "problem": "пусто в
+    NocoDB" | "значение не совпадает"}.
+    """
+    try:
+        status, actual_record = _request("GET", f"{RECORDS_URL}/{record_id}", token)
+    except Exception as e:
+        return {"ok": False, "checked_fields": 0, "issues": [
+            {"column": None, "expected": None, "actual": None,
+             "problem": f"не удалось перечитать запись для проверки: {e}"}
+        ]}
+    if status != 200:
+        return {"ok": False, "checked_fields": 0, "issues": [
+            {"column": None, "expected": None, "actual": None,
+             "problem": f"не удалось перечитать запись для проверки: HTTP {status} {actual_record}"}
+        ]}
+
+    issues = []
+    for col, expected_value in expected_row.items():
+        actual_value = actual_record.get(col)
+        if not _values_match(expected_value, actual_value):
+            issues.append({
+                "column": col,
+                "expected": expected_value,
+                "actual": actual_value,
+                "problem": "пусто в NocoDB" if _normalize_compare(actual_value) == "" else "значение не совпадает",
+            })
+    return {"ok": not issues, "checked_fields": len(expected_row), "issues": issues}
+
+
+def verify_spec_table(token, table_id, expected_rows):
+    """Re-fetches every row just written into a "Спецификация — ..." table
+    (Шаг 7.1 в CLAUDE.md) and compares it against `expected_rows` (the
+    already-sanitized rows sync_specification() actually sent - see
+    sanitize_spec_row()): row count, "Наименование позиции", and the numeric
+    columns (Кол-во / НМЦК за позицию / Рыночная цена, руб.). Matched by
+    insertion order (NocoDB assigns Id sequentially within a bulk insert -
+    the same assumption clear_table_records() already relies on for cleanup).
+    Added 2026-09-09 alongside verify_main_record() - see its docstring for
+    why.
+
+    Returns {"ok": bool, "expected_rows": int, "actual_rows": int or None,
+    "issues": [...]}. A row-count mismatch is reported on its own (row-by-row
+    comparison is skipped in that case, since positions can no longer be
+    trusted to line up). Each per-row issue is {"row": <1-based index>,
+    "item": <"Наименование позиции">, "column": ..., "expected": ...,
+    "actual": ..., "problem": ...}.
+    """
+    try:
+        status, body = _request("GET", f"{BASE_URL}/{table_id}/records?limit=1000", token)
+    except Exception as e:
+        return {"ok": False, "expected_rows": len(expected_rows), "actual_rows": None, "issues": [
+            {"row": None, "item": None, "column": None, "expected": None, "actual": None,
+             "problem": f"не удалось перечитать таблицу спецификации для проверки: {e}"}
+        ]}
+    if status != 200:
+        return {"ok": False, "expected_rows": len(expected_rows), "actual_rows": None, "issues": [
+            {"row": None, "item": None, "column": None, "expected": None, "actual": None,
+             "problem": f"не удалось перечитать таблицу спецификации для проверки: HTTP {status} {body}"}
+        ]}
+
+    actual_rows = sorted(body.get("list", []), key=lambda r: r.get("Id", 0))
+    issues = []
+    if len(actual_rows) != len(expected_rows):
+        issues.append({
+            "row": None, "item": None, "column": None, "expected": None, "actual": None,
+            "problem": f"количество строк не совпадает: отправлено {len(expected_rows)}, найдено в NocoDB {len(actual_rows)}",
+        })
+    else:
+        checked_columns = ("Наименование позиции",) + NUMERIC_SPEC_COLUMNS
+        for idx, (expected, actual) in enumerate(zip(expected_rows, actual_rows), start=1):
+            item_name = expected.get("Наименование позиции") or f"строка {idx}"
+            for col in checked_columns:
+                expected_value = expected.get(col)
+                actual_value = actual.get(col)
+                numeric = col in NUMERIC_SPEC_COLUMNS
+                if not _values_match(expected_value, actual_value, numeric=numeric):
+                    issues.append({
+                        "row": idx,
+                        "item": item_name,
+                        "column": col,
+                        "expected": expected_value,
+                        "actual": actual_value,
+                        "problem": "пусто в NocoDB" if _normalize_compare(actual_value) == "" else "значение не совпадает",
+                    })
+    return {"ok": not issues, "expected_rows": len(expected_rows), "actual_rows": len(actual_rows), "issues": issues}
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", required=True, help="Path to the flat extracted-fields JSON")
@@ -860,6 +1031,22 @@ def main():
         fx_rates["€"] = args.eur_rate
 
     result = upsert(token, flat_data, spec_xlsx_path=args.xlsx, fallback_id=args.fallback_id, fx_rates=fx_rates or None)
+
+    verification = result.get("verification") or {}
+    if not verification.get("ok", True):
+        print(
+            f"WARNING: post-write verification found {len(verification.get('issues', []))} "
+            "issue(s) in the main record - see \"verification\" in the JSON output below.",
+            file=sys.stderr,
+        )
+    spec_verification = result.get("spec_verification")
+    if spec_verification and not spec_verification.get("ok", True):
+        print(
+            f"WARNING: post-write verification found {len(spec_verification.get('issues', []))} "
+            "issue(s) in the specification table - see \"spec_verification\" in the JSON output below.",
+            file=sys.stderr,
+        )
+
     print(json.dumps(result, ensure_ascii=False))
 
 
