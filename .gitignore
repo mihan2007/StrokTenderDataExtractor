@@ -12,3 +12,6 @@ __pycache__/
 /_test_entry/
 /_test_entry2/
 /_to_delete/
+
+# Локальные настройки конкретной машины (базовая папка тендеров) — у каждого компьютера своя, в git не попадает
+/tools/tender_base_folder.txt

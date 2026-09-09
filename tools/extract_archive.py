@@ -85,6 +85,13 @@ def find_unrar_tool():
     Prefers the copy bundled in tools/bin/unrar (committed to the project,
     so it survives across sandbox sessions) over whatever may or may not be
     present in the current sandbox image.
+
+    Each candidate is test-executed (not just checked for the executable
+    bit) before being accepted: tools/bin/unrar is a Linux x86-64 binary
+    committed to the repo, so on a different OS/CPU (e.g. macOS, including
+    Apple Silicon) it exists and is technically "executable" but fails to
+    actually run. In that case we fall through to a system-installed unrar
+    instead of hard-failing (on macOS: `brew install unrar`).
     """
     candidates = [
         os.path.join(TOOLS_DIR, "bin", "unrar"),
@@ -94,8 +101,13 @@ def find_unrar_tool():
         "/tmp/extracted_pkg/usr/bin/unrar-nonfree",
     ]
     for c in candidates:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
+        if not c or not os.path.isfile(c) or not os.access(c, os.X_OK):
+            continue
+        try:
+            subprocess.run([c], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue  # not runnable on this platform/arch (e.g. bundled Linux binary on macOS)
+        return c
     return None
 
 

@@ -360,6 +360,48 @@ def apply_dash_placeholders(flat_data):
     return flat_data
 
 
+# Fields whose NocoDB target column is a "Ссылка на ..." URL field that (unlike
+# the spec table's "Источник (ссылка)" column - see the big comment near
+# SPEC_COLUMNS above) DOES enforce strict isURL validation at the API level -
+# confirmed empirically 2026-09-09 on a real tender (ЗК-715-2024) whose
+# Извещение had no direct link: sending tender_url = "—" (the DASH placeholder
+# above, per Блок 6 в CLAUDE.md) into "Ссылка на процедуру" made the WHOLE
+# create/update request fail with HTTP 400 {"msg":"Validation failed : isURL"}
+# - these two were most likely hand-created in the NocoDB UI (unlike the
+# API-created spec table columns), where "Validate as URL" can be ticked on.
+# "platform_url" -> "Ссылка на площадку" maps the same way and would fail the
+# same way if it is ever missing/placeholder text, so it gets the same guard
+# even though only tender_url has hit this in practice so far.
+STRICT_URL_FIELDS = ("tender_url", "platform_url")
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def _looks_like_url(value) -> bool:
+    return bool(_URL_RE.match(str(value or "").strip()))
+
+def format_source_files(raw):
+    """Mirrors save_tender.py's format_source_files(): the same " + "-joined
+    string built for save_tender.py's --source-file (Шаг 7, п.3 в CLAUDE.md)
+    -> one file per line ("a.docx\nb.pdf") - "Файл-источник" is a rich-text
+    column here too (see save_tender.py's own docstring on this, 2026-09-07).
+    Added 2026-09-08 after a user report that this column kept coming out
+    empty in NocoDB: save_tender.py takes the file list via --source-file
+    (a CLI flag, not a JSON key) and never needed "source_file" in the JSON
+    at all, so past sessions had no reason to put it there - but this script
+    only reads flat_data from --json (no equivalent CLI flag exists here),
+    so the field must actually be present in that JSON for this column to
+    get anything. CLAUDE.md Шаг 7 now says to include it. A single file (no
+    " + " found) is returned unchanged."""
+    if raw is None:
+        return raw
+    parts = [p.strip() for p in str(raw).split(" + ") if p.strip()]
+    if len(parts) <= 1:
+        return raw
+    return "\n".join(parts)
+
+
+
+
 # "Начальная цена" (main table, FIELD_MAP["start_price"]) is plain SingleLineText,
 # not Decimal - it has to stay text because it also holds the NOT_SPECIFIED
 # placeholder and occasional multi-number text ("3805861.62 руб. включая НДС
@@ -545,6 +587,8 @@ def upsert(token, flat_data: dict, spec_xlsx_path: str = None, fallback_id: str 
         flat_data["start_price"] = to_comma_decimal(str(flat_data["start_price"]))
     if flat_data.get("address"):
         flat_data["address"] = bold_address_except_index(str(flat_data["address"]))
+    if flat_data.get("source_file"):
+        flat_data["source_file"] = format_source_files(str(flat_data["source_file"]))
 
     ensure_columns(token, TABLE_ID, [FIELD_MAP.get(k) for k in flat_data.keys()])
 
@@ -553,6 +597,12 @@ def upsert(token, flat_data: dict, spec_xlsx_path: str = None, fallback_id: str 
         col = FIELD_MAP.get(flat_name)
         if col is None:
             continue  # unknown field, skip rather than fail
+        if flat_name in STRICT_URL_FIELDS and not _looks_like_url(value):
+            # Don't send "—"/NOT_SPECIFIED/anything else into a strictly-
+            # validating URL column - see STRICT_URL_FIELDS comment above.
+            # Omitting the key just leaves that column blank in NocoDB,
+            # instead of failing the entire record create/update.
+            continue
         row[col] = value
 
     spec_table_url = None
@@ -661,9 +711,15 @@ def sync_specification(token, purchase_number: str, spec_rows: list):
     table_id = table["id"]
     if spec_rows:
         safe_rows = [sanitize_spec_row(r) for r in spec_rows]
-        status, body = _request("POST", f"{BASE_URL}/{table_id}/records", token, safe_rows)
-        if status != 200:
-            raise RuntimeError(f"insert spec rows failed: HTTP {status} {body}")
+        # NocoDB's bulk-insert endpoint caps a single request at 100 records
+        # (HTTP 422 ERR_MAX_PAYLOAD_LIMIT_EXCEEDED) - found 2026-09-09 on a
+        # real 116-position tender. Split into batches to stay under that cap.
+        NOCODB_MAX_BATCH = 100
+        for i in range(0, len(safe_rows), NOCODB_MAX_BATCH):
+            batch = safe_rows[i:i + NOCODB_MAX_BATCH]
+            status, body = _request("POST", f"{BASE_URL}/{table_id}/records", token, batch)
+            if status != 200:
+                raise RuntimeError(f"insert spec rows failed: HTTP {status} {body}")
 
     view_id = get_default_view_id(token, table_id)
     url = f"https://app.nocodb.com/{WORKSPACE_ID}/{BASE_ID}/{table_id}"

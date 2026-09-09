@@ -73,7 +73,12 @@ def find_odf_files(scan_dir):
 
 
 def find_soffice():
-    candidates = [shutil.which("soffice"), shutil.which("libreoffice"), "/usr/bin/soffice"]
+    candidates = [
+        shutil.which("soffice"),
+        shutil.which("libreoffice"),
+        "/usr/bin/soffice",  # common Linux path
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",  # macOS default install path (not on PATH by default)
+    ]
     for c in candidates:
         if c and os.path.isfile(c) and os.access(c, os.X_OK):
             return c
