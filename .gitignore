@@ -15,3 +15,7 @@ __pycache__/
 
 # Локальные настройки конкретной машины (базовая папка тендеров) — у каждого компьютера своя, в git не попадает
 /tools/tender_base_folder.txt
+
+# Tender registry with real data - local only, never published
+/all_tenders.csv
+/all_tenders_backup_*.csv
